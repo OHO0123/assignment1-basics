@@ -104,24 +104,51 @@ class Tokenizer:
         self.special_tokens = special_tokens or []
         self.bytes_to_id = {v: k for k, v in vocab.items()}
         
-        # 正则匹配规则
+        # 【修复1】：特殊 token 排序与正则分组
         special_pat = ""
         if self.special_tokens:
-            special_pat = "|".join(re.escape(st) for st in self.special_tokens) + "|"
+            # 按长度降序排列，防止重叠截断（比如长 token 被短的抢先匹配）
+            sorted_specials = sorted(self.special_tokens, key=len, reverse=True)
+            # 用括号分组，确保它们作为一个整体匹配
+            special_pat = "(" + "|".join(re.escape(st) for st in sorted_specials) + ")|"
+            
         PAT = special_pat + r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
         self.pattern = re.compile(PAT)
 
     def encode(self, text: str) -> list[int]:
         token_ids = []
+        
+        # 【绝对防御】：如果存在特殊 token，先用字符串的 split 把它切开
+        if self.special_tokens:
+            # 按长度降序排列，先切长的，再切短的，防止误伤
+            sorted_specials = sorted(self.special_tokens, key=len, reverse=True)
+            
+            # 构建一个正则，用于按特殊 token 分割文本
+            split_pattern = "(" + "|".join(re.escape(st) for st in sorted_specials) + ")"
+            
+            # 使用 re.split，这样文本会被特殊 token 切分成多段，且特殊 token 也会保留在列表中
+            parts = re.split(split_pattern, text)
+            
+            for part in parts:
+                if not part:
+                    continue
+                # 如果这一段刚好是个特殊 token，直接转成 ID 存入，跳过 BPE
+                if part in self.special_tokens:
+                    token_ids.append(self.bytes_to_id[part.encode("utf-8")])
+                else:
+                    # 如果是普通文本，递归调用真正的 BPE 编码逻辑
+                    token_ids.extend(self._encode_normal(part))
+            return token_ids
+        else:
+            # 如果没有特殊 token，直接走正常逻辑
+            return self._encode_normal(text)
+
+    def _encode_normal(self, text: str) -> list[int]:
+        # 把原来 encode 里的 BPE 逻辑原封不动搬到这里
+        token_ids = []
         cache = {}
         for match in self.pattern.finditer(text):
             word = match.group()
-            
-            # 处理特殊 token
-            if word in self.special_tokens:
-                token_ids.append(self.bytes_to_id[word.encode("utf-8")])
-                continue
-                
             if word in cache:
                 token_ids.extend(cache[word])
                 continue
@@ -147,3 +174,45 @@ class Tokenizer:
     def decode(self, ids: list[int]) -> str:
         byte_list = [self.vocab.get(i, b'') for i in ids]
         return b''.join(byte_list).decode("utf-8", errors="replace")
+
+    def encode_iterable(self, iterable):
+        """
+        极速流式编码。按固定大小块读取（默认 1MB）并处理块边界截断。
+        """
+        # 这里的 iterable 是文件句柄，我们按 1MB 的大小来读
+        chunk_size = 1024 * 1024 
+        
+        # 缓冲区，用来存放上一次没读完的“半截单词”
+        buffer = ""
+        
+        while True:
+            # 1. 每次读 1MB。如果是二进制文件，这里直接读 bytes
+            chunk = iterable.read(chunk_size)
+            if not chunk:
+                break
+                
+            # 2. 将之前的“半截单词”和这一次读的数据拼接
+            chunk = buffer + chunk
+            
+            # 3. 寻找最后一个空格或换行符（确保不会把单词切断）
+            # 如果当前块还有后续（没到文件尾），就找到最后一个空格切分
+            last_space_idx = max(chunk.rfind(" "), chunk.rfind("\n"))
+            
+            if last_space_idx != -1 and len(chunk) == chunk_size:
+                # 如果找到了空格，就把空格之前的全编码了
+                text_to_encode = chunk[:last_space_idx]
+                # 把空格之后的部分留作下一次的 buffer
+                buffer = chunk[last_space_idx:]
+            else:
+                # 如果没找到空格（或者文件只有一行，没有空格），就只能全量编码
+                text_to_encode = chunk
+                buffer = ""
+                
+            # 4. 对切分好的安全文本块进行编码
+            for token_id in self.encode(text_to_encode):
+                yield token_id
+                
+        # 5. 循环结束后，把最后遗留的 buffer 也编码掉
+        if buffer:
+            for token_id in self.encode(buffer):
+                yield token_id
