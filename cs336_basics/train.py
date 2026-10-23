@@ -9,7 +9,9 @@ from torch.nn import functional as F
 from cs336_basics.modules import TransformerLM, cross_entropy, gradient_clipping
 from cs336_basics.optimizer import AdamW, get_lr_cosine_schedule
 from cs336_basics.data import get_batch
-from cs336_basics.serialization import save_checkpoint, load_checkpoint
+# --- 替换掉找不到的 serialization，直接从 adapters 导入 ---
+from tests.adapters import run_save_checkpoint as save_checkpoint
+from tests.adapters import run_load_checkpoint as load_checkpoint
 
 def parse_args():
     parser = argparse.ArgumentParser()
