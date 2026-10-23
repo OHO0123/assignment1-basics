@@ -95,3 +95,55 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: List[str]) -> Tu
         # ================= 优化结束 =================
 
     return vocab, merges
+
+
+class Tokenizer:
+    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens or []
+        self.bytes_to_id = {v: k for k, v in vocab.items()}
+        
+        # 正则匹配规则
+        special_pat = ""
+        if self.special_tokens:
+            special_pat = "|".join(re.escape(st) for st in self.special_tokens) + "|"
+        PAT = special_pat + r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+        self.pattern = re.compile(PAT)
+
+    def encode(self, text: str) -> list[int]:
+        token_ids = []
+        cache = {}
+        for match in self.pattern.finditer(text):
+            word = match.group()
+            
+            # 处理特殊 token
+            if word in self.special_tokens:
+                token_ids.append(self.bytes_to_id[word.encode("utf-8")])
+                continue
+                
+            if word in cache:
+                token_ids.extend(cache[word])
+                continue
+                
+            word_bytes = [bytes([b]) for b in word.encode("utf-8")]
+            for pair in self.merges:
+                i = 0
+                new_word = []
+                while i < len(word_bytes):
+                    if i < len(word_bytes) - 1 and word_bytes[i] == pair[0] and word_bytes[i+1] == pair[1]:
+                        new_word.append(pair[0] + pair[1])
+                        i += 2
+                    else:
+                        new_word.append(word_bytes[i])
+                        i += 1
+                word_bytes = new_word
+                
+            encoded_word = [self.bytes_to_id.get(b, 0) for b in word_bytes]
+            cache[word] = encoded_word
+            token_ids.extend(encoded_word)
+        return token_ids
+        
+    def decode(self, ids: list[int]) -> str:
+        byte_list = [self.vocab.get(i, b'') for i in ids]
+        return b''.join(byte_list).decode("utf-8", errors="replace")

@@ -8,7 +8,7 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
-from cs336_basics.bpe import train_bpe
+from cs336_basics.bpe import train_bpe, Tokenizer
 from cs336_basics.modules import *
 from cs336_basics.optimizer import AdamW, get_lr_cosine_schedule
 from cs336_basics.data import get_batch
@@ -646,7 +646,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return Tokenizer(vocab, merges, special_tokens)
 
 
 def run_train_bpe(

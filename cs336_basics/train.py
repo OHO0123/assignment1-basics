@@ -3,13 +3,13 @@ import time
 import argparse
 import numpy as np
 import torch
+import csv  # <--- 新增：导入 csv 库
 from torch.nn import functional as F
 
 # 导入你写好的模块
 from cs336_basics.modules import TransformerLM, cross_entropy, gradient_clipping
 from cs336_basics.optimizer import AdamW, get_lr_cosine_schedule
 from cs336_basics.data import get_batch
-# --- 替换掉找不到的 serialization，直接从 adapters 导入 ---
 from tests.adapters import run_save_checkpoint as save_checkpoint
 from tests.adapters import run_load_checkpoint as load_checkpoint
 
@@ -19,6 +19,10 @@ def parse_args():
     parser.add_argument("--train_data", type=str, required=True, help="Path to train data (e.g., .npy)")
     parser.add_argument("--val_data", type=str, required=True, help="Path to val data")
     parser.add_argument("--checkpoint_path", type=str, default="checkpoint.pt")
+    
+    # <--- 新增：实验日志的保存路径 --->
+    parser.add_argument("--log_file", type=str, default="experiment_log.csv", help="Path to save the CSV log")
+    
     # 模型超参
     parser.add_argument("--vocab_size", type=int, default=10000)
     parser.add_argument("--context_length", type=int, default=256)
@@ -40,8 +44,7 @@ def parse_args():
 def main():
     args = parse_args()
     
-    # 1. 内存映射加载数据 (Memory-efficient)
-    # mmap_mode='r' 意味着只读，用到哪加载哪，不占满内存
+    # 1. 内存映射加载数据
     train_data = np.load(args.train_data, mmap_mode='r')
     val_data = np.load(args.val_data, mmap_mode='r')
     
@@ -56,8 +59,6 @@ def main():
         rope_theta=10000.0
     ).to(args.device)
     
-    # PyTorch 的 AdamW 只是做接口，底层调用你写的
-    # 注意：如果你自己实现了完整的 AdamW 类，直接用你的
     optimizer = AdamW(model.parameters(), lr=args.max_lr)
     
     # 3. 尝试恢复 Checkpoint
@@ -66,6 +67,16 @@ def main():
         print(f"Loading checkpoint from {args.checkpoint_path}...")
         start_step = load_checkpoint(args.checkpoint_path, model, optimizer)
         print(f"Resumed from step {start_step}")
+
+    # =========================================================
+    # <--- 新增：初始化 CSV 日志文件 --->
+    # a 模式表示追加。这样即使断点续训，也不会覆盖之前的数据
+    log_exists = os.path.exists(args.log_file)
+    log_f = open(args.log_file, "a", newline="")
+    writer = csv.writer(log_f)
+    if not log_exists:
+        writer.writerow(["Step", "Train_Loss", "Val_Loss", "LR", "Time_ms"])
+    # =========================================================
 
     # 4. 训练循环
     model.train()
@@ -84,14 +95,13 @@ def main():
         
         # --- (3) 前向传播 + 算 Loss ---
         logits = model(x)
-        # 把 (B, T, V) 展平成 (B*T, V)，标签展平为 (B*T,)
         loss = cross_entropy(logits.view(-1, args.vocab_size), y.view(-1))
         
         # --- (4) 反向传播 ---
         optimizer.zero_grad()
         loss.backward()
         
-        # --- (5) 梯度裁剪（防爆炸）---
+        # --- (5) 梯度裁剪 ---
         gradient_clipping(model.parameters(), max_l2_norm=1.0)
         
         # --- (6) 更新参数 ---
@@ -99,27 +109,36 @@ def main():
         
         dt = time.time() - t0
         
-        # --- (7) 日志打印 ---
+        # --- (7) 日志打印与保存 ---
         if step % 10 == 0:
             print(f"Step {step:5d} | Loss: {loss.item():.4f} | LR: {lr:.2e} | Time: {dt*1000:.1f}ms")
+            # <--- 新增：每 10 步写入一行 CSV --->
+            writer.writerow([step, loss.item(), "", lr, dt * 1000])
+            log_f.flush() # 保证立刻写入硬盘
             
         # --- (8) 验证集评估 ---
         if step % args.eval_interval == 0 and step > 0:
             model.eval()
             val_loss = 0.0
             with torch.no_grad():
-                for _ in range(10): # 跑 10 个 batch 取平均
+                for _ in range(10):
                     vx, vy = get_batch(val_data, args.batch_size, args.context_length, args.device)
                     vlogits = model(vx)
                     val_loss += cross_entropy(vlogits.view(-1, args.vocab_size), vy.view(-1)).item()
             val_loss /= 10
             print(f"--- Validation Loss at Step {step}: {val_loss:.4f} ---")
+            # <--- 新增：写入验证集 Loss --->
+            writer.writerow([step, "", val_loss, lr, ""])
+            log_f.flush()
             model.train()
             
         # --- (9) 保存 Checkpoint ---
         if step % args.save_interval == 0 and step > 0:
             save_checkpoint(model, optimizer, step, args.checkpoint_path)
             print(f"Checkpoint saved at Step {step}.")
+
+    # <--- 新增：训练结束后关闭文件 --->
+    log_f.close()
 
 if __name__ == "__main__":
     main()
