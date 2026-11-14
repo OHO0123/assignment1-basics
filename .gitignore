@@ -162,3 +162,9 @@ cython_debug/
 .ruff_cache/
 *.zip
 data/
+# 训练产物
+runs/
+*.pt
+*.npy
+token.json
+credentials.json

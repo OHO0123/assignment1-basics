@@ -12,6 +12,7 @@ from cs336_basics.bpe import train_bpe, Tokenizer
 from cs336_basics.modules import *
 from cs336_basics.optimizer import AdamW, get_lr_cosine_schedule
 from cs336_basics.data import get_batch
+from cs336_basics.checkpoint import load_checkpoint, save_checkpoint
 
 def run_linear(
     d_in: int,
@@ -461,7 +462,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return in_features * torch.sigmoid(in_features)
 
 
 def run_get_batch(
@@ -587,14 +588,7 @@ def run_save_checkpoint(
     """
     Given a model, optimizer, and an iteration number, serialize them to disk.
     """
-    # 1. 打包状态
-    checkpoint = {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "iteration": iteration,
-    }
-    # 2. 保存
-    torch.save(checkpoint, out)
+    save_checkpoint(model, optimizer, iteration, out)
 
 
 def run_load_checkpoint(
@@ -615,15 +609,7 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-        # 1. 读取文件
-    checkpoint = torch.load(src)
-    
-    # 2. 恢复模型和优化器
-    model.load_state_dict(checkpoint["model"])
-    optimizer.load_state_dict(checkpoint["optimizer"])
-    
-    # 3. 把迭代次数返回给调用者
-    return checkpoint["iteration"]
+    return load_checkpoint(src, model, optimizer)
 
 
 def get_tokenizer(

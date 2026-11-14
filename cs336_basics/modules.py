@@ -2,6 +2,12 @@ import torch
 import torch.nn as nn
 import math
 
+
+def silu(x: torch.Tensor) -> torch.Tensor:
+    """SiLU 激活函数: x * sigmoid(x), 等价于 nn.SiLU。"""
+    return x * torch.sigmoid(x)
+
+
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
         super().__init__()
@@ -83,18 +89,33 @@ class SwiGLU(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 1. 算 W1 * x，然后过 SiLU 激活函数
-        # SiLU(x) = x * sigmoid(x)，官方提示直接用 torch.sigmoid 稳定
-        w1_out = self.w1(x)
-        silu_out = w1_out * torch.sigmoid(w1_out)
-        
+        silu_out = silu(self.w1(x))
+
         # 2. 算 W3 * x (门控通道)
         w3_out = self.w3(x)
-        
+
         # 3. 两个通道逐元素相乘 (Hadamard 积)
         gated = silu_out * w3_out
-        
+
         # 4. 最后过 W2 降维回 d_model
         return self.w2(gated)
+
+
+class FFNSiLU(nn.Module):
+    """无门控的 SiLU 前馈网络, 用于 swiglu_ablation 对照。
+
+    FFN_SiLU(x) = W2 * SiLU(W1 * x)，只有两个权重矩阵。
+    为了和 SwiGLU (三个矩阵, 每个 d_ff=1344) 参数量对齐,
+    d_ff 应取 4 * d_model (约 2048)。
+    """
+
+    def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
+        super().__init__()
+        self.w1 = Linear(d_model, d_ff, device=device, dtype=dtype)
+        self.w2 = Linear(d_ff, d_model, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(silu(self.w1(x)))
 
 
 class RoPE(nn.Module):
@@ -237,20 +258,23 @@ class MultiHeadAttention(nn.Module):
 
 
 class MultiHeadAttentionWithRoPE(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, max_seq_len: int, theta: float):
+    def __init__(self, d_model: int, num_heads: int, max_seq_len: int, theta: float,
+                 use_rope: bool = True):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
-        
+        self.use_rope = use_rope
+
         self.q_proj = Linear(d_model, d_model)
         self.k_proj = Linear(d_model, d_model)
         self.v_proj = Linear(d_model, d_model)
         self.output_proj = Linear(d_model, d_model)
-        
-        # 实例化你刚才写好的 RoPE 模块
-        # 注意：传入的 d_k 是每个头的维度，因为两两分组是在每个头内部进行的
-        self.rope = RoPE(d_k=self.d_k, theta=theta, max_seq_len=max_seq_len)
+
+        # use_rope=False 时完全不创建 RoPE (NoPE 消融), 省显存也避免多余 buffer
+        if use_rope:
+            # 注意：传入的 d_k 是每个头的维度，因为两两分组是在每个头内部进行的
+            self.rope = RoPE(d_k=self.d_k, theta=theta, max_seq_len=max_seq_len)
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
@@ -266,9 +290,10 @@ class MultiHeadAttentionWithRoPE(nn.Module):
         v = v.view(B, T, self.num_heads, self.d_k).transpose(1, 2)
         
         # 3. 应用 RoPE (只对 q 和 k！)
-        # 因为你的 RoPE forward 接收的是 (..., seq_len, d_k)，现在形状是 (B, heads, T, d_k)，完美匹配
-        q = self.rope(q, token_positions)
-        k = self.rope(k, token_positions)
+        # 形状 (B, heads, T, d_k) 正好匹配 RoPE 要求的 (..., seq_len, d_k)
+        if self.use_rope:
+            q = self.rope(q, token_positions)
+            k = self.rope(k, token_positions)
         
         # 4. 因果掩码
         mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
@@ -285,57 +310,73 @@ class MultiHeadAttentionWithRoPE(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int = 2048, theta: float = 10000.0):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int = 2048,
+                 theta: float = 10000.0, norm_style: str = "pre", use_rope: bool = True,
+                 ffn_type: str = "swiglu"):
         super().__init__()
-        
-        # 1. 两个前置 LayerNorm
-        self.ln1 = RMSNorm(d_model)
-        self.ln2 = RMSNorm(d_model)
-        
-        # 2. 多头注意力 (带 RoPE)
-        # 注意：你刚才写好的 MultiHeadAttentionWithRoPE 需要传入这 4 个参数
-        self.attn = MultiHeadAttentionWithRoPE(d_model, num_heads, max_seq_len, theta)
-        
-        # 3. FFN (SwiGLU)
-        self.ffn = SwiGLU(d_model, d_ff)
-        
+        if norm_style not in ("pre", "post", "none"):
+            raise ValueError(f"norm_style 必须是 pre/post/none, 收到 {norm_style!r}")
+        if ffn_type not in ("swiglu", "silu"):
+            raise ValueError(f"ffn_type 必须是 swiglu/silu, 收到 {ffn_type!r}")
+
+        self.norm_style = norm_style
+        self.ffn_type = ffn_type
+
+        # 1. LayerNorm (norm_style="none" 时整体移除, 对应 layer_norm_ablation)
+        if norm_style != "none":
+            self.ln1 = RMSNorm(d_model)
+            self.ln2 = RMSNorm(d_model)
+
+        # 2. 多头注意力 (use_rope=False 时退化为 NoPE)
+        self.attn = MultiHeadAttentionWithRoPE(
+            d_model, num_heads, max_seq_len, theta, use_rope=use_rope
+        )
+
+        # 3. FFN (SwiGLU 或 无门控 SiLU)
+        if ffn_type == "swiglu":
+            self.ffn = SwiGLU(d_model, d_ff)
+        else:
+            self.ffn = FFNSiLU(d_model, d_ff)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 获取输入形状：批次大小 B，序列长度 T，模型维度 C
         B, T, C = x.shape
-        
-        # 动态生成 token 位置编码 (0 到 T-1)
-        # 无论序列多长，都能自动适配
-        token_positions = torch.arange(T, device=x.device).unsqueeze(0) # 形状: (1, T)
-        
-        # ==========================================
-        # 第一个子层：Pre-Norm Attention + 残差连接
-        # ==========================================
-        # 先 Norm 再 Attention，最后加上原始 x
-        attn_out = self.attn(self.ln1(x), token_positions)
-        x = x + attn_out
-        
-        # ==========================================
-        # 第二个子层：Pre-Norm FFN + 残差连接
-        # ==========================================
-        # 先 Norm 再 FFN，最后加上更新后的 x
-        ffn_out = self.ffn(self.ln2(x))
-        x = x + ffn_out
-        
+
+        # 动态生成 token 位置 (0 到 T-1)，NoPE 时虽然不用但传参保持接口一致
+        token_positions = torch.arange(T, device=x.device).unsqueeze(0)  # (1, T)
+
+        if self.norm_style == "pre":
+            # Pre-Norm: z = x + Attn(Norm(x)); y = z + FFN(Norm(z))
+            x = x + self.attn(self.ln1(x), token_positions)
+            x = x + self.ffn(self.ln2(x))
+        elif self.norm_style == "post":
+            # Post-Norm: z = Norm(x + Attn(x)); y = Norm(z + FFN(z))
+            x = self.ln1(x + self.attn(x, token_positions))
+            x = self.ln2(x + self.ffn(x))
+        else:
+            # 无归一化，直接残差堆叠
+            x = x + self.attn(x, token_positions)
+            x = x + self.ffn(x)
+
         return x
 
 
 
 class TransformerLM(nn.Module):
-    def __init__(self, vocab_size, context_length, d_model, num_layers, num_heads, d_ff, rope_theta):
+    def __init__(self, vocab_size, context_length, d_model, num_layers, num_heads, d_ff, rope_theta,
+                 norm_style: str = "pre", use_rope: bool = True, ffn_type: str = "swiglu"):
         super().__init__()
         self.context_length = context_length
-        
+        self.norm_style = norm_style
+
         # 1. 词嵌入层 (你之前写好的 Embedding)
         self.token_embeddings = Embedding(vocab_size, d_model)
-        
+
         # 2. 堆叠 N 层 Transformer Block (使用 ModuleList 完美兼容官方权重键名)
         self.layers = nn.ModuleList([
-            TransformerBlock(d_model, num_heads, d_ff, max_seq_len=context_length, theta=rope_theta)
+            TransformerBlock(d_model, num_heads, d_ff, max_seq_len=context_length,
+                             theta=rope_theta, norm_style=norm_style,
+                             use_rope=use_rope, ffn_type=ffn_type)
             for _ in range(num_layers)
         ])
         
