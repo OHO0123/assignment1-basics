@@ -365,6 +365,9 @@ def main():
                     else f"checkpoint_step{step}.pt"
                 )
                 maybe_upload(args, args.ckpt_latest, cloud_name)
+                # 日志很小（几十 KB），顺手传一份，session 结束也不会丢
+                log_f.flush()
+                maybe_upload(args, args.log_file, "experiment_log.csv")
 
     # 训练结束：无条件补一次最终验证与保存，避免丢最后一段权重
     final_val = evaluate(model, val_data, args, use_amp)
@@ -382,9 +385,10 @@ def main():
 
     save_checkpoint(model, optimizer, args.total_steps, args.ckpt_final)
     print(f"[final] Checkpoint saved: {args.ckpt_final}")
-    maybe_upload(args, args.ckpt_final, "checkpoint_final.pt")
-
     log_f.close()
+
+    maybe_upload(args, args.ckpt_final, "checkpoint_final.pt")
+    maybe_upload(args, args.log_file, "experiment_log.csv")
 
 
 if __name__ == "__main__":
