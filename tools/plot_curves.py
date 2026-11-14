@@ -108,10 +108,10 @@ def main():
         tps = tokens_per_step(run_dir)
         if args.xaxis == "tokens" and tps:
             x = [s * tps / 1e6 for s in series["step"]]
-            xlabel = "已处理 token 数 (M)"
+            xlabel = "Tokens processed (M)"
         else:
             x = series["step"]
-            xlabel = "step"
+            xlabel = "Training step"
 
         # 验证曲线
         vx = [xi for xi, v in zip(x, series["val"]) if v == v]
